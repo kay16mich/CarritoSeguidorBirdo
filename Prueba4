@@ -1,0 +1,386 @@
+/////////////////////// SENSADO DE QTR-8A /////////////////////////////////
+
+// Pines analógicos donde están conectados los 8 sensores QTR-8A
+const int pines_sensores[8] = {A7, A6, A5, A4, A3, A2, A1, A0};
+
+// Arreglo para almacenar las lecturas analógicas de los sensores
+int sensores[8];
+
+// Arreglo para almacenar el estado digital de cada sensor
+int digital[8];
+
+// Variables utilizadas durante la calibración
+long lectura_fondo[8] = {0};
+long lectura_linea[8] = {0};
+
+// Umbral individual calculado para cada sensor
+int umbral[8];
+
+///////////////////////// BOTONES, LED Y LDR //////////////////////////////
+
+// Botón utilizado para calibración y paro de emergencia
+#define BOTONB   2
+
+// LED indicador de estados del sistema
+#define LED      10
+
+// Entrada digital del módulo LDR para arranque automático
+#define pinLDR   8
+
+/////////////////////// MOTORES (TB6612FNG) ///////////////////////////////
+
+// PWM del motor izquierdo
+#define pwmi     3
+
+// Pines de dirección del motor izquierdo
+#define izq1     4
+#define izq2     5
+
+// PWM del motor derecho
+#define pwmd     11
+
+// Pines de dirección del motor derecho
+#define der1     7
+#define der2     6
+
+// Variables auxiliares para el cálculo de posición
+long int sumap, suma, pos, poslast;
+
+///////////////////////////////////////////////////////////////////////////
+//////////////////////////// CONTROL PID //////////////////////////////////
+///////////////////////////////////////////////////////////////////////////
+
+// Ganancia proporcional encargada de corregir el error actual
+float KP = 0.32;
+
+// Ganancia derivativa para amortiguar movimientos bruscos
+float KD = 0.20;
+
+// Ganancia integral mínima para evitar acumulación excesiva
+float KI = 0.001;
+
+// Velocidad base del robot
+int vel = 95;
+
+//////////////////// HISTORIAL DE ERRORES /////////////////////////////////
+
+// Se almacenan únicamente los últimos cuatro errores
+// para la acción integral
+int error1=0;
+int error2=0;
+int error3=0;
+int error4=0;
+
+//////////////////// VARIABLES DEL PID ////////////////////////////////////
+
+// Error actual respecto al centro
+int proporcional=0;
+
+// Suma de errores recientes
+int integral=0;
+
+// Variación del error
+int derivativo=0;
+
+// Error proporcional del ciclo anterior
+int last_prop;
+
+// Posición ideal de la línea
+int setpoint=350;
+
+///////////////////////////////////////////////////////////////////////////
+void setup() {
+
+  // Inicialización de la comunicación serial
+  Serial.begin(9600);
+
+  // Configuración de frecuencia PWM para los motores
+  TCCR2B = TCCR2B & B11111000 | B00000011;
+
+  // Configuración de pines de motores
+  pinMode(izq1, OUTPUT);
+  pinMode(izq2, OUTPUT);
+  pinMode(der1, OUTPUT);
+  pinMode(der2, OUTPUT);
+
+  // Configuración de LED indicador
+  pinMode(LED, OUTPUT);
+
+  // Configuración del botón utilizando pullup interno
+  pinMode(BOTONB, INPUT_PULLUP);
+
+  // Configuración del sensor LDR
+  pinMode(pinLDR, INPUT);
+
+  /////////////////////////////////////////////////////////////////////////
+  // CALIBRACIÓN DE FONDO
+  /////////////////////////////////////////////////////////////////////////
+
+  // Se enciende el LED para indicar modo calibración
+  digitalWrite(LED, HIGH);
+
+  Serial.println("Esperando calibracion de FONDO...");
+
+  // Espera a que el usuario presione y suelte el botón
+  while(digitalRead(BOTONB) == HIGH);
+  while(digitalRead(BOTONB) == LOW);
+
+  delay(200);
+
+  Serial.println("Calibrando fondo...");
+
+  // Se toman 50 muestras sobre el fondo blanco
+  for(int i = 0; i < 50; i++){
+
+    for(int j = 0; j < 8; j++){
+      lectura_fondo[j] += analogRead(pines_sensores[j]);
+    }
+
+    // Parpadeo del LED para indicar proceso activo
+    digitalWrite(LED, LOW);
+    delay(10);
+
+    digitalWrite(LED, HIGH);
+    delay(10);
+  }
+
+  /////////////////////////////////////////////////////////////////////////
+  // CALIBRACIÓN DE LÍNEA
+  /////////////////////////////////////////////////////////////////////////
+
+  Serial.println("Esperando calibracion de LINEA...");
+
+  while(digitalRead(BOTONB) == HIGH);
+  while(digitalRead(BOTONB) == LOW);
+
+  delay(200);
+
+  Serial.println("Calibrando linea...");
+
+  // Se toman 50 muestras sobre la línea negra
+  for(int i = 0; i < 50; i++){
+
+    for(int j = 0; j < 8; j++){
+      lectura_linea[j] += analogRead(pines_sensores[j]);
+    }
+
+    digitalWrite(LED, LOW);
+    delay(10);
+
+    digitalWrite(LED, HIGH);
+    delay(10);
+  }
+
+  // Calcula los umbrales individuales
+  promedio();
+
+  // Apaga el LED al finalizar la calibración
+  digitalWrite(LED, LOW);
+
+  Serial.println("Calibracion terminada.");
+  Serial.println("Esperando LUZ en el LDR...");
+
+  /////////////////////////////////////////////////////////////////////////
+  // ESPERA DE ARRANQUE
+  /////////////////////////////////////////////////////////////////////////
+
+  // El robot permanece detenido hasta detectar luz
+  while(digitalRead(pinLDR) == HIGH){
+    digitalWrite(LED, HIGH);
+  }
+
+  digitalWrite(LED, LOW);
+
+  Serial.println("¡LUZ DETECTADA! ¡GO!");
+
+  delay(100);
+}
+
+///////////////////////////////////////////////////////////////////////////
+void loop() {
+
+  // Bucle principal de seguimiento de línea
+  while(true){
+
+    // Obtiene la posición actual de la línea
+    lectura();
+
+    // Ejecuta el controlador PID
+    PID();
+
+    // Paro de emergencia mediante botón
+    if(digitalRead(BOTONB) == LOW){
+
+      motores(0,0);
+
+      Serial.println("Paro de emergencia.");
+
+      delay(500);
+
+      break;
+    }
+  }
+
+  // Mantiene detenido el robot permanentemente
+  while(true){
+    motores(0,0);
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////
+////////////////////// CÁLCULO DE UMBRALES ////////////////////////////////
+///////////////////////////////////////////////////////////////////////////
+
+void promedio() {
+
+  // Calcula el punto medio entre fondo y línea
+  // para cada sensor individualmente
+  for(int i = 0; i < 8; i++){
+
+    int fondo_promedio = lectura_fondo[i] / 50;
+    int linea_promedio = lectura_linea[i] / 50;
+
+    umbral[i] = (fondo_promedio + linea_promedio) / 2;
+  }
+}
+
+///////////////////////////////////////////////////////////////////////////
+//////////////////////// LECTURA DE SENSORES //////////////////////////////
+///////////////////////////////////////////////////////////////////////////
+
+int lectura(void) {
+
+  suma = 0;
+
+  // Lee los ocho sensores y los convierte a digital
+  for(int i = 0; i < 8; i++){
+
+    sensores[i] = analogRead(pines_sensores[i]);
+
+    // Si la lectura supera el umbral se considera detección
+    digital[i] = (sensores[i] > umbral[i]) ? 1 : 0;
+
+    suma += digital[i];
+  }
+
+  // Cálculo de posición mediante promedio ponderado
+  sumap =
+  (700L * digital[0] +
+   600L * digital[1] +
+   500L * digital[2] +
+   400L * digital[3] +
+   300L * digital[4] +
+   200L * digital[5] +
+   100L * digital[6] +
+     0L * digital[7]);
+
+  // Obtiene la posición de la línea
+  if(suma != 0)
+    pos = sumap / suma;
+  else
+    pos = -1;
+
+  // Si se pierde la línea se utiliza la última posición conocida
+  if(pos == -1)
+    pos = (poslast < 350) ? 0 : 700;
+  else
+    poslast = pos;
+
+  return pos;
+}
+
+///////////////////////////////////////////////////////////////////////////
+//////////////////////////// CONTROL PID //////////////////////////////////
+///////////////////////////////////////////////////////////////////////////
+
+void PID(){
+
+  // Calcula el error respecto al centro de la pista
+  proporcional = pos - setpoint;
+
+  // Calcula la velocidad de cambio del error
+  derivativo = proporcional - last_prop;
+
+  // Suma los últimos cuatro errores para la acción integral
+  integral = error1 + error2 + error3 + error4;
+
+  // Actualiza historial de errores
+  last_prop = proporcional;
+
+  error4 = error3;
+  error3 = error2;
+  error2 = error1;
+  error1 = proporcional;
+
+  // Calcula la salida del controlador PID
+  int diferencial =
+  (proporcional * KP) +
+  (derivativo * KD) +
+  (integral * KI);
+
+  /////////////////////////////////////////////////////////////////////////
+  // ESCALADO DINÁMICO DEL DIFERENCIAL
+  /////////////////////////////////////////////////////////////////////////
+
+  // Limita la corrección máxima al 80% de la velocidad base
+  int maxDif = vel * 0.8;
+
+  if(diferencial > maxDif)
+    diferencial = maxDif;
+  else if(diferencial < -maxDif)
+    diferencial = -maxDif;
+
+  /////////////////////////////////////////////////////////////////////////
+  // AJUSTE DIFERENCIAL DE MOTORES
+  /////////////////////////////////////////////////////////////////////////
+
+  // Reduce la velocidad de un motor para generar el giro
+  (diferencial < 0)
+  ? motores(vel + diferencial, vel)
+  : motores(vel, vel - diferencial);
+}
+
+///////////////////////////////////////////////////////////////////////////
+//////////////////////// CONTROL DE MOTORES ///////////////////////////////
+///////////////////////////////////////////////////////////////////////////
+
+void motores(int izq, int der){
+
+  ////////////////// MOTOR IZQUIERDO //////////////////
+
+  // Avance
+  if(izq >= 0){
+
+    digitalWrite(izq1, LOW);
+    digitalWrite(izq2, HIGH);
+  }
+  else{
+
+    // Retroceso
+    digitalWrite(izq1, HIGH);
+    digitalWrite(izq2, LOW);
+
+    izq = -izq;
+  }
+
+  analogWrite(pwmi, izq);
+
+  ////////////////// MOTOR DERECHO ///////////////////
+
+  // Avance
+  if(der >= 0){
+
+    digitalWrite(der1, HIGH);
+    digitalWrite(der2, LOW);
+  }
+  else{
+
+    // Retroceso
+    digitalWrite(der1, LOW);
+    digitalWrite(der2, HIGH);
+
+    der = -der;
+  }
+
+  analogWrite(pwmd, der);
+}
